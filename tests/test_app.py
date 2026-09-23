@@ -309,3 +309,13 @@ def test_pas_de_rejeu_au_milieu_d_une_transaction():
     # Rejouer seule la 2e requête sur une liaison neuve perdrait la 1re : on refuse.
     with pytest.raises(ValueError, match="baton"):
         conn.execute("UPDATE reglages SET valeur = 'y'")
+
+
+def test_streamlit_cloud_sans_turso_refuse_de_demarrer(monkeypatch):
+    # Sans ce garde-fou, l'app tournerait sur une base locale vide, effacée à
+    # chaque redémarrage : les comptes créés disparaîtraient en silence.
+    monkeypatch.setattr(bd, "SUR_STREAMLIT_CLOUD", True)
+    monkeypatch.setattr(bd, "DISTANT", False)
+    monkeypatch.setattr(bd, "_connexion", None)
+    with pytest.raises(bd.ErreurBase, match="TURSO_DATABASE_URL"):
+        bd.get_colocs()

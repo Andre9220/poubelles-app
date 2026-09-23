@@ -47,6 +47,9 @@ UPLOADS = _config("POUBELLES_UPLOADS", os.path.join(_ICI, "data", "uploads"))
 TURSO_URL = _config("TURSO_DATABASE_URL")
 TURSO_TOKEN = _config("TURSO_AUTH_TOKEN", "")
 DISTANT = bool(TURSO_URL)
+# Streamlit Cloud clone le dépôt dans /mount/src : son disque est effacé à chaque
+# redémarrage, donc une base SQLite locale y perdrait silencieusement tout.
+SUR_STREAMLIT_CLOUD = _ICI.startswith("/mount/src/")
 
 # Les serveurs de Streamlit Cloud sont en UTC et la variable TZ n'y est pas
 # fiable : on calcule l'heure de Montréal explicitement, partout.
@@ -243,6 +246,12 @@ def _ouvrir():
             MODE = "turso-direct"
         return connexion
 
+    if SUR_STREAMLIT_CLOUD:
+        raise ErreurBase(
+            "Configuration incomplète : les secrets TURSO_DATABASE_URL et "
+            "TURSO_AUTH_TOKEN sont introuvables. Ajoute-les dans Settings → "
+            "Secrets de l'app Streamlit, puis redémarre-la."
+        )
     os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
     conn = sqlite3.connect(DB, timeout=15, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -273,6 +282,8 @@ def db():
         if _connexion is None:
             try:
                 _connexion = _ouvrir()
+            except ErreurBase:
+                raise
             except Exception as e:
                 raise ErreurBase(f"Base de données injoignable : {e}") from e
         conn = _connexion
