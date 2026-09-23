@@ -5,7 +5,7 @@ en dernier. Cela garantit mécaniquement les deux contraintes demandées — jam
 deux tours d'affilée, et une répartition parfaitement équitable.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import timedelta
 
 import database as bd
 
@@ -25,7 +25,7 @@ def jours_collecte():
 
 def prochaine_date(depuis=None):
     """Prochain jour de collecte, aujourd'hui inclus."""
-    depuis = depuis or date.today()
+    depuis = depuis or bd.aujourdhui()
     jours = jours_collecte()
     for delta in range(8):
         j = depuis + timedelta(days=delta)

@@ -1,11 +1,9 @@
-"""Authentification : bcrypt + session persistante côté Streamlit.
+"""Authentification : bcrypt, anti-force-brute et session persistante.
 
 `st.session_state` est vidé à chaque rechargement de page, ce qui déconnecterait
-tout le monde au moindre refresh sur téléphone. On stocke donc un token opaque
-en base et on le remet dans l'URL (`?t=...`) pour retrouver la session.
+tout le monde au moindre refresh sur téléphone. On stocke donc un jeton opaque
+en base, posé en cookie et relu côté serveur à chaque visite.
 """
-
-import os
 
 import bcrypt
 import streamlit as st
@@ -66,9 +64,9 @@ def _jeton_cookie():
         return None
 
 # Code demandé à l'inscription, pour éviter qu'un inconnu se crée un compte.
-CODE_INVITATION = os.environ.get("POUBELLES_CODE_INVITATION", "coloc2026")
+CODE_INVITATION = bd._config("POUBELLES_CODE_INVITATION", "coloc2026")
 # Pseudo qui obtient les droits admin à l'inscription.
-PSEUDO_ADMIN = os.environ.get("POUBELLES_ADMIN", "andre").lower()
+PSEUDO_ADMIN = str(bd._config("POUBELLES_ADMIN", "andre")).lower()
 
 MDP_MIN = 6
 
@@ -101,8 +99,13 @@ def colocs_sans_compte():
     return [c for c in bd.get_colocs() if not c["password_hash"]]
 
 
+def code_invitation():
+    """Code en vigueur : celui fixé depuis l'admin, sinon celui de la configuration."""
+    return bd.get_reglage("code_invitation") or CODE_INVITATION
+
+
 def inscrire(nom, pseudo, mdp, confirmation, code, photo=None, coloc_existant=None):
-    if code != CODE_INVITATION:
+    if code != code_invitation():
         raise bd.ErreurBase("Code d'invitation incorrect. Demande-le à ton coloc admin.")
     valider_mot_de_passe(mdp, confirmation)
     hash_mdp = hacher(mdp)
@@ -122,10 +125,21 @@ def inscrire(nom, pseudo, mdp, confirmation, code, photo=None, coloc_existant=No
 
 
 def connecter(pseudo, mdp):
-    coloc = bd.get_coloc_par_pseudo((pseudo or "").strip())
+    pseudo = (pseudo or "").strip()
+    # Clé de blocage par pseudo, y compris inexistant : sinon un attaquant
+    # saurait quels pseudos existent en voyant lesquels se font bloquer.
+    cle = pseudo.lower()
+    attente = bd.minutes_blocage(cle)
+    if attente:
+        raise bd.ErreurBase(
+            f"Trop de tentatives. Réessaie dans {attente} min."
+        )
+    coloc = bd.get_coloc_par_pseudo(pseudo)
     # Message identique dans les deux cas : ne pas révéler quels pseudos existent.
     if not coloc or not verifier(mdp, coloc["password_hash"]):
+        bd.noter_echec(cle)
         raise bd.ErreurBase("Pseudo ou mot de passe incorrect.")
+    bd.effacer_echecs(cle)
     if not coloc["actif"]:
         raise bd.ErreurBase("Ce compte a été désactivé.")
     token = bd.creer_session(coloc["id"])

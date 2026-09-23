@@ -1,22 +1,62 @@
-"""Couche d'accès SQLite pour Mission Poubelles.
+"""Couche d'accès aux données de Mission Poubelles.
 
-Toutes les fonctions ouvrent une connexion courte et la referment : Streamlit
-exécute les scripts dans plusieurs threads, une connexion globale ne serait pas
-sûre. Le mode WAL permet aux lectures de ne pas bloquer les écritures.
+Deux modes, choisis automatiquement :
+
+- **local** : un fichier SQLite (Umbrel, poste de dev). C'est le mode par défaut.
+- **Turso** : dès que `TURSO_DATABASE_URL` est défini (Streamlit Cloud). La base
+  vit chez Turso ; l'app en garde une *réplique embarquée* dans un fichier
+  local. Les lectures se font sur la réplique, donc instantanément, et seules
+  les écritures partent sur le réseau. Sans ça, un affichage de la page admin
+  (~200 requêtes) coûterait plusieurs secondes d'allers-retours.
+
+Une seule connexion est partagée par le processus, protégée par un verrou :
+Streamlit exécute chaque session dans son propre thread.
 """
 
+import base64
+import json
 import os
 import re
 import sqlite3
 import secrets
+import tempfile
+import threading
+import uuid
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-DB = os.environ.get("POUBELLES_DB", "/app/data/poubelles.db")
-UPLOADS = os.environ.get("POUBELLES_UPLOADS", "/app/data/uploads")
+
+def _config(nom, defaut=None):
+    """Variable d'environnement, sinon secret Streamlit, sinon valeur par défaut."""
+    valeur = os.environ.get(nom)
+    if valeur:
+        return valeur
+    try:
+        import streamlit as st
+
+        return st.secrets.get(nom, defaut)
+    except Exception:
+        return defaut
+
+
+_ICI = os.path.dirname(os.path.abspath(__file__))
+DB = _config("POUBELLES_DB", os.path.join(_ICI, "data", "poubelles.db"))
+# Ancien stockage des photos sur disque, conservé pour la migration vers la base.
+UPLOADS = _config("POUBELLES_UPLOADS", os.path.join(_ICI, "data", "uploads"))
+TURSO_URL = _config("TURSO_DATABASE_URL")
+TURSO_TOKEN = _config("TURSO_AUTH_TOKEN", "")
+DISTANT = bool(TURSO_URL)
+
+# Les serveurs de Streamlit Cloud sont en UTC et la variable TZ n'y est pas
+# fiable : on calcule l'heure de Montréal explicitement, partout.
+FUSEAU = ZoneInfo(_config("POUBELLES_FUSEAU", "America/Toronto"))
 
 POINTS_PAR_SORTIE = 10
 DUREE_SESSION_JOURS = 180
+# Anti-force-brute : au-delà, le pseudo est bloqué pendant la fenêtre.
+TENTATIVES_MAX = 5
+FENETRE_TENTATIVES_MIN = 15
 
 # Paramètres modifiables depuis la page admin, avec leurs valeurs par défaut.
 REGLAGES_DEFAUT = {
@@ -25,31 +65,242 @@ REGLAGES_DEFAUT = {
     "delai_max_heures": "24",
 }
 
+# Tables sauvegardées et restaurées, dans l'ordre d'insertion. Les sessions et
+# les tentatives de connexion n'en font volontairement pas partie.
+TABLES_SAUVEGARDE = [
+    "colocataires", "historique", "demandes", "reglages",
+    "notifications", "audit", "photos",
+]
+
 
 class ErreurBase(Exception):
     """Erreur métier lisible, à afficher telle quelle à l'utilisateur."""
 
 
-@contextmanager
-def db():
-    os.makedirs(os.path.dirname(DB), exist_ok=True)
-    conn = sqlite3.connect(DB, timeout=15, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=15000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        yield conn
-        conn.commit()
-    except sqlite3.Error as e:
-        conn.rollback()
-        raise ErreurBase(f"Erreur base de données : {e}") from e
-    finally:
-        conn.close()
+def heure():
+    """Heure de Montréal, sans fuseau attaché (format stocké en base)."""
+    return datetime.now(FUSEAU).replace(tzinfo=None, microsecond=0)
+
+
+def aujourdhui():
+    return heure().date()
 
 
 def maintenant():
-    return datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    return heure().isoformat(sep=" ")
+
+
+# --------------------------------------------------------------------------
+# Connexion
+# --------------------------------------------------------------------------
+
+_ECRITURE = re.compile(r"^\s*(INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)", re.I)
+
+
+class _Ligne:
+    """Ligne accessible par nom ou par position, comme sqlite3.Row."""
+
+    __slots__ = ("_valeurs", "_index")
+
+    def __init__(self, valeurs, index):
+        self._valeurs = valeurs
+        self._index = index
+
+    def __getitem__(self, cle):
+        if isinstance(cle, str):
+            return self._valeurs[self._index[cle]]
+        return self._valeurs[cle]
+
+    def keys(self):
+        return self._index.keys()
+
+    def __iter__(self):
+        return iter(self._valeurs)
+
+    def __len__(self):
+        return len(self._valeurs)
+
+
+class _Curseur:
+    def __init__(self, curseur):
+        self._c = curseur
+
+    def _index(self):
+        return {d[0]: i for i, d in enumerate(self._c.description or ())}
+
+    def fetchone(self):
+        ligne = self._c.fetchone()
+        return None if ligne is None else _Ligne(ligne, self._index())
+
+    def fetchall(self):
+        index = self._index()
+        return [_Ligne(l, index) for l in self._c.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    @property
+    def lastrowid(self):
+        return self._c.lastrowid
+
+
+_SIGNES_LIAISON = ("hrana", "baton", "connect", "stream", "sync error", "timed out")
+
+
+def _erreur_liaison(e):
+    """Vrai si l'exception vient de la liaison avec Turso et non d'une requête fautive.
+
+    libsql signale les coupures réseau par un ValueError (« Hrana: … »), pas par
+    son propre type d'erreur : il faut donc regarder le message.
+    """
+    return isinstance(e, (ValueError, OSError, RuntimeError)) and any(
+        signe in str(e).lower() for signe in _SIGNES_LIAISON
+    )
+
+
+class _ConnexionTurso:
+    """Adapte libsql (qui renvoie des tuples) à l'interface de sqlite3.Row.
+
+    Les flux Turso expirent après un moment d'inactivité : sans précaution, la
+    première requête de la journée échouerait. Tant qu'aucune écriture n'est en
+    cours, une liaison périmée est donc rouverte et la requête rejouée.
+    """
+
+    def __init__(self, fabrique, replique):
+        self._fabrique = fabrique
+        self._c = fabrique()
+        self._replique = replique
+        self.a_ecrit = False
+
+    def execute(self, sql, params=()):
+        try:
+            curseur = self._c.execute(sql, tuple(params))
+        except Exception as e:
+            if self.a_ecrit or not _erreur_liaison(e):
+                raise  # une transaction était entamée : la rejouer serait faux
+            self._c = self._fabrique()
+            curseur = self._c.execute(sql, tuple(params))
+        if _ECRITURE.match(sql):
+            self.a_ecrit = True
+        return _Curseur(curseur)
+
+    def cursor(self):
+        return self
+
+    def commit(self):
+        self._c.commit()
+        if self.a_ecrit and self._replique:
+            # Garantit que la réplique locale voit l'écriture avant la lecture suivante.
+            self._c.sync()
+        self.a_ecrit = False
+
+    def rollback(self):
+        self.a_ecrit = False
+        self._c.rollback()
+
+
+# Mode effectivement utilisé, affiché dans la page admin pour le diagnostic.
+MODE = "sqlite"
+
+
+def _supprimer_replique(chemin):
+    for suffixe in ("", "-wal", "-shm", "-info", "-client_wal_index"):
+        try:
+            os.remove(chemin + suffixe)
+        except OSError:
+            pass
+
+
+def _ouvrir():
+    global MODE
+    if DISTANT:
+        import libsql
+
+        # Streamlit sert chaque session dans son propre thread : la connexion
+        # est partagée, et le verrou de db() garantit un seul usage à la fois.
+        replique = os.path.join(tempfile.gettempdir(), "poubelles-replique.db")
+        def en_replique():
+            conn = libsql.connect(
+                replique, sync_url=TURSO_URL, auth_token=TURSO_TOKEN,
+                sync_interval=30, _check_same_thread=False,
+            )
+            conn.sync()
+            return conn
+
+        def en_direct():
+            return libsql.connect(
+                database=TURSO_URL, auth_token=TURSO_TOKEN, _check_same_thread=False
+            )
+
+        try:
+            connexion = _ConnexionTurso(en_replique, replique=True)
+            MODE = "turso-replique"
+        except Exception:
+            # Réplique indisponible (protocole de synchro non supporté, disque
+            # plein…) : on se rabat sur le mode distant direct, plus lent mais sûr.
+            _supprimer_replique(replique)
+            connexion = _ConnexionTurso(en_direct, replique=False)
+            MODE = "turso-direct"
+        return connexion
+
+    os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
+    conn = sqlite3.connect(DB, timeout=15, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    MODE = "sqlite"
+    return conn
+
+
+_verrou = threading.RLock()
+_connexion = None
+
+
+def _erreurs_base():
+    erreurs = [sqlite3.Error]
+    if DISTANT:
+        import libsql
+
+        erreurs.append(libsql.Error)
+    return tuple(erreurs)
+
+
+@contextmanager
+def db():
+    global _connexion
+    with _verrou:
+        if _connexion is None:
+            try:
+                _connexion = _ouvrir()
+            except Exception as e:
+                raise ErreurBase(f"Base de données injoignable : {e}") from e
+        conn = _connexion
+        try:
+            yield conn
+            conn.commit()
+        except Exception as e:
+            _annuler(conn)
+            liaison = DISTANT and _erreur_liaison(e)
+            if liaison:
+                # On repartira d'une connexion neuve au prochain appel.
+                _connexion = None
+            if liaison or isinstance(e, _erreurs_base()):
+                raise ErreurBase(
+                    "Base de données momentanément injoignable, réessaie."
+                    if liaison else f"Erreur base de données : {e}"
+                ) from e
+            raise
+        except BaseException:
+            _annuler(conn)
+            raise
+
+
+def _annuler(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass  # connexion déjà cassée : il n'y a plus rien à annuler
 
 
 # --------------------------------------------------------------------------
@@ -68,10 +319,6 @@ def _ajouter_colonne(cur, table, nom, definition):
 
 def init_db():
     """Crée le schéma et migre l'ancienne base sans perdre de données."""
-    os.makedirs(UPLOADS, exist_ok=True)
-    os.makedirs(os.path.join(UPLOADS, "profils"), exist_ok=True)
-    os.makedirs(os.path.join(UPLOADS, "poubelles"), exist_ok=True)
-
     with db() as conn:
         cur = conn.cursor()
 
@@ -169,6 +416,31 @@ def init_db():
             )
         """)
 
+        # Photos stockées en base : Streamlit Cloud n'a pas de disque persistant.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS photos(
+                id TEXT PRIMARY KEY,
+                contenu BLOB NOT NULL,
+                cree_le TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tentatives(
+                cle TEXT NOT NULL,
+                ts TEXT NOT NULL
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tentatives ON tentatives(cle, ts)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audit(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                admin_id INTEGER,
+                action TEXT NOT NULL,
+                detail TEXT
+            )
+        """)
+
         for cle, valeur in REGLAGES_DEFAUT.items():
             cur.execute(
                 "INSERT OR IGNORE INTO reglages(cle, valeur) VALUES (?, ?)",
@@ -176,6 +448,7 @@ def init_db():
             )
 
         _backfill(cur)
+        _migrer_photos_fichiers(cur)
 
 
 def _backfill(cur):
@@ -197,6 +470,123 @@ def _backfill(cur):
             SELECT c.id FROM colocataires c WHERE c.nom = historique.personne
         ) WHERE coloc_id IS NULL
     """)
+
+
+def _migrer_photos_fichiers(cur):
+    """Importe en base les photos encore stockées comme fichiers (ancienne version)."""
+    for table in ("colocataires", "historique"):
+        lignes = cur.execute(
+            f"SELECT id, photo FROM {table} "
+            "WHERE photo IS NOT NULL AND photo NOT LIKE 'db:%'"
+        ).fetchall()
+        for ligne in lignes:
+            chemin = os.path.join(UPLOADS, ligne["photo"])
+            if not os.path.isfile(chemin):
+                continue  # fichier perdu : on garde la référence, elle s'affichera vide
+            with open(chemin, "rb") as f:
+                contenu = f.read()
+            ref = uuid.uuid4().hex
+            cur.execute(
+                "INSERT INTO photos(id, contenu, cree_le) VALUES (?, ?, ?)",
+                (ref, contenu, maintenant()),
+            )
+            cur.execute(
+                f"UPDATE {table} SET photo = ? WHERE id = ?", (f"db:{ref}", ligne["id"])
+            )
+
+
+# --------------------------------------------------------------------------
+# Photos
+# --------------------------------------------------------------------------
+
+def stocker_photo(contenu):
+    """Enregistre une image (octets JPEG) et renvoie sa référence « db:… »."""
+    ref = uuid.uuid4().hex
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO photos(id, contenu, cree_le) VALUES (?, ?, ?)",
+            (ref, contenu, maintenant()),
+        )
+    return f"db:{ref}"
+
+
+def lire_photo(ref):
+    """Octets de la photo, ou None si absente."""
+    if not ref:
+        return None
+    if ref.startswith("db:"):
+        with db() as conn:
+            ligne = conn.execute(
+                "SELECT contenu FROM photos WHERE id = ?", (ref[3:],)
+            ).fetchone()
+        return bytes(ligne["contenu"]) if ligne else None
+    # Référence héritée : fichier sur disque (Umbrel, avant migration).
+    chemin = os.path.join(UPLOADS, ref)
+    if os.path.isfile(chemin):
+        with open(chemin, "rb") as f:
+            return f.read()
+    return None
+
+
+def supprimer_photo(ref):
+    if ref and ref.startswith("db:"):
+        with db() as conn:
+            conn.execute("DELETE FROM photos WHERE id = ?", (ref[3:],))
+
+
+# --------------------------------------------------------------------------
+# Anti-force-brute
+# --------------------------------------------------------------------------
+
+def minutes_blocage(cle):
+    """Minutes restantes de blocage pour ce pseudo, ou 0."""
+    debut = (heure() - timedelta(minutes=FENETRE_TENTATIVES_MIN)).isoformat(sep=" ")
+    with db() as conn:
+        conn.execute("DELETE FROM tentatives WHERE ts < ?", (debut,))
+        lignes = conn.execute(
+            "SELECT ts FROM tentatives WHERE cle = ? ORDER BY ts", (cle,)
+        ).fetchall()
+    if len(lignes) < TENTATIVES_MAX:
+        return 0
+    liberation = datetime.fromisoformat(lignes[0]["ts"]) + timedelta(
+        minutes=FENETRE_TENTATIVES_MIN
+    )
+    return max(1, int((liberation - heure()).total_seconds() // 60) + 1)
+
+
+def noter_echec(cle):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO tentatives(cle, ts) VALUES (?, ?)", (cle, maintenant())
+        )
+
+
+def effacer_echecs(cle):
+    with db() as conn:
+        conn.execute("DELETE FROM tentatives WHERE cle = ?", (cle,))
+
+
+# --------------------------------------------------------------------------
+# Journal d'audit des actions admin
+# --------------------------------------------------------------------------
+
+def journaliser_action(admin_id, action, detail=""):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO audit(ts, admin_id, action, detail) VALUES (?, ?, ?, ?)",
+            (maintenant(), admin_id, action, detail),
+        )
+
+
+def get_audit(limite=50):
+    with db() as conn:
+        lignes = conn.execute(
+            """SELECT a.*, c.nom AS nom_admin FROM audit a
+               LEFT JOIN colocataires c ON c.id = a.admin_id
+               ORDER BY a.id DESC LIMIT ?""",
+            (limite,),
+        ).fetchall()
+    return [dict(l) for l in lignes]
 
 
 # --------------------------------------------------------------------------
@@ -272,9 +662,7 @@ def valider_apikey(cle):
 
 def notification_recente(coloc_id, message, minutes=30):
     """Évite de renvoyer le même message trop souvent (quotas CallMeBot)."""
-    seuil = (datetime.now() - timedelta(minutes=minutes)).replace(
-        microsecond=0
-    ).isoformat(sep=" ")
+    seuil = (heure() - timedelta(minutes=minutes)).isoformat(sep=" ")
     with db() as conn:
         row = conn.execute(
             """SELECT 1 FROM notifications
@@ -470,7 +858,7 @@ def ajouter_sortie(coloc_id, photo=None, demande=None, enregistre_par=None):
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 coloc["nom"],
-                datetime.now().strftime("%d/%m/%Y %H:%M"),
+                heure().strftime("%d/%m/%Y %H:%M"),
                 coloc_id,
                 ts,
                 photo,
@@ -577,7 +965,7 @@ def classement():
 
 def stats_globales():
     """Chiffres clés du tableau de bord admin."""
-    debut_mois = date.today().replace(day=1).isoformat()
+    debut_mois = aujourdhui().replace(day=1).isoformat()
     with db() as conn:
         total = conn.execute("SELECT COUNT(*) AS n FROM historique").fetchone()["n"]
         ce_mois = conn.execute(
@@ -654,6 +1042,102 @@ def deconnecter_partout(coloc_id):
         conn.execute("DELETE FROM sessions WHERE coloc_id = ?", (coloc_id,))
 
 
+def ajuster_points(coloc_id, delta, motif, admin_id):
+    """Bonus ou malus manuel, tracé dans le journal d'audit. Renvoie le nouveau total."""
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        raise ErreurBase("Le nombre de points doit être un entier.")
+    if delta == 0:
+        raise ErreurBase("Indique un nombre de points différent de zéro.")
+    motif = (motif or "").strip()[:120]
+    if not motif:
+        raise ErreurBase("Indique un motif : il apparaîtra dans le journal.")
+    with db() as conn:
+        coloc = conn.execute(
+            "SELECT nom, points FROM colocataires WHERE id = ?", (coloc_id,)
+        ).fetchone()
+        if coloc is None:
+            raise ErreurBase("Colocataire introuvable.")
+        total = max(0, coloc["points"] + delta)
+        conn.execute("UPDATE colocataires SET points = ? WHERE id = ?", (total, coloc_id))
+        conn.execute(
+            "INSERT INTO audit(ts, admin_id, action, detail) VALUES (?, ?, ?, ?)",
+            (maintenant(), admin_id, "Points ajustés",
+             f"{coloc['nom']} {delta:+d} → {total} pts ({motif})"),
+        )
+    return total
+
+
+# --------------------------------------------------------------------------
+# Sauvegarde et restauration
+# --------------------------------------------------------------------------
+
+FORMAT_SAUVEGARDE = "mission-poubelles"
+
+
+def exporter():
+    """Toute la base en JSON (photos en base64). Sans sessions ni tentatives."""
+    donnees = {
+        "format": FORMAT_SAUVEGARDE,
+        "version": 1,
+        "exporte_le": maintenant(),
+        "tables": {},
+    }
+    with db() as conn:
+        for table in TABLES_SAUVEGARDE:
+            lignes = []
+            for ligne in conn.execute(f"SELECT * FROM {table}").fetchall():
+                d = dict(ligne)
+                if table == "photos":
+                    d["contenu"] = base64.b64encode(bytes(d["contenu"])).decode()
+                lignes.append(d)
+            donnees["tables"][table] = lignes
+    return json.dumps(donnees, ensure_ascii=False)
+
+
+def restaurer(texte):
+    """Remplace toute la base par une sauvegarde. Renvoie le nombre de lignes par table.
+
+    Tout se fait dans une seule transaction : en cas d'erreur, rien n'est modifié.
+    Les sessions sont vidées, donc tout le monde devra se reconnecter.
+    """
+    try:
+        donnees = json.loads(texte)
+    except (ValueError, TypeError):
+        raise ErreurBase("Fichier de sauvegarde illisible.")
+    if not isinstance(donnees, dict) or donnees.get("format") != FORMAT_SAUVEGARDE:
+        raise ErreurBase("Ce fichier n'est pas une sauvegarde Mission Poubelles.")
+    tables = donnees.get("tables") or {}
+    if not tables.get("colocataires"):
+        raise ErreurBase("Sauvegarde sans colocataires : restauration refusée.")
+
+    with db() as conn:
+        for table in reversed(TABLES_SAUVEGARDE):
+            conn.execute(f"DELETE FROM {table}")
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM tentatives")
+        for table in TABLES_SAUVEGARDE:
+            # Seules les colonnes réellement présentes sont reprises : les noms
+            # viennent du fichier et ne doivent jamais atteindre le SQL tels quels.
+            colonnes = _colonnes(conn, table)
+            for ligne in tables.get(table) or []:
+                d = {k: v for k, v in ligne.items() if k in colonnes}
+                if not d:
+                    continue
+                if table == "photos":
+                    try:
+                        d["contenu"] = base64.b64decode(d["contenu"])
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                conn.execute(
+                    f"INSERT INTO {table}({', '.join(d)}) "
+                    f"VALUES ({', '.join('?' * len(d))})",
+                    tuple(d.values()),
+                )
+    return {t: len(tables.get(t) or []) for t in TABLES_SAUVEGARDE}
+
+
 def reset_planning(effacer_historique=False):
     """Remet les compteurs à zéro. L'historique n'est effacé que sur demande."""
     with db() as conn:
@@ -671,11 +1155,11 @@ def reset_planning(effacer_historique=False):
 
 def creer_session(coloc_id):
     token = secrets.token_urlsafe(32)
-    expire = datetime.now() + timedelta(days=DUREE_SESSION_JOURS)
+    expire = heure() + timedelta(days=DUREE_SESSION_JOURS)
     with db() as conn:
         conn.execute(
             "INSERT INTO sessions(token, coloc_id, cree_le, expire_le) VALUES (?, ?, ?, ?)",
-            (token, coloc_id, maintenant(), expire.replace(microsecond=0).isoformat(sep=" ")),
+            (token, coloc_id, maintenant(), expire.isoformat(sep=" ")),
         )
     return token
 
@@ -692,10 +1176,10 @@ def coloc_par_session(token):
         ).fetchone()
         if row:
             # Fenêtre glissante : tant qu'on s'en sert, la session ne périme pas.
-            expire = datetime.now() + timedelta(days=DUREE_SESSION_JOURS)
+            expire = heure() + timedelta(days=DUREE_SESSION_JOURS)
             conn.execute(
                 "UPDATE sessions SET expire_le = ? WHERE token = ?",
-                (expire.replace(microsecond=0).isoformat(sep=" "), token),
+                (expire.isoformat(sep=" "), token),
             )
     return dict(row) if row else None
 

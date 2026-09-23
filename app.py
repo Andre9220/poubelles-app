@@ -2,9 +2,7 @@
 
 import html
 import io
-import os
-import uuid
-from datetime import date, datetime
+from datetime import datetime
 
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
@@ -21,7 +19,15 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-bd.init_db()
+
+@st.cache_resource(show_spinner=False)
+def _preparer_base():
+    # Une fois par processus, pas à chaque clic : sur Turso, chaque vérification
+    # de schéma coûterait un aller-retour réseau.
+    bd.init_db()
+    return True
+
+
 
 # Interface pensée pour le téléphone : gros boutons, cartes lisibles.
 st.markdown(
@@ -47,8 +53,11 @@ TAILLE_MAX_PHOTO = 5 * 1024 * 1024
 # Photos
 # --------------------------------------------------------------------------
 
-def enregistrer_photo(fichier, dossier):
-    """Compresse et enregistre une photo. Renvoie le chemin relatif ou None."""
+def enregistrer_photo(fichier, dossier=None):
+    """Compresse une photo et la stocke en base. Renvoie sa référence ou None.
+
+    `dossier` ne sert plus : conservé pour ne pas toucher aux appels existants.
+    """
     if fichier is None:
         return None
     if fichier.size > TAILLE_MAX_PHOTO:
@@ -62,26 +71,13 @@ def enregistrer_photo(fichier, dossier):
         image.save(tampon, format="JPEG", quality=80)
     except (UnidentifiedImageError, OSError):
         raise bd.ErreurBase("Fichier image illisible.")
-
-    nom = f"{uuid.uuid4().hex}.jpg"
-    destination = os.path.join(bd.UPLOADS, dossier)
-    os.makedirs(destination, exist_ok=True)
-    with open(os.path.join(destination, nom), "wb") as f:
-        f.write(tampon.getvalue())
-    return f"{dossier}/{nom}"
-
-
-def chemin_photo(relatif):
-    if not relatif:
-        return None
-    chemin = os.path.join(bd.UPLOADS, relatif)
-    return chemin if os.path.exists(chemin) else None
+    return bd.stocker_photo(tampon.getvalue())
 
 
 def avatar(coloc, taille=90):
-    chemin = chemin_photo(coloc.get("photo") if coloc else None)
-    if chemin:
-        st.image(chemin, width=taille)
+    contenu = bd.lire_photo(coloc.get("photo") if coloc else None)
+    if contenu:
+        st.image(contenu, width=taille)
     else:
         st.markdown(
             f"<div style='font-size:{taille}px; line-height:1'>👤</div>",
@@ -203,7 +199,7 @@ def page_accueil(moi):
     else:
         # --- Signalement en cours : la personne de tour doit valider ---------
         depuis = sched.delai_lisible(
-            (datetime.now() - datetime.fromisoformat(demande["ts"])).total_seconds()
+            (bd.heure() - datetime.fromisoformat(demande["ts"])).total_seconds()
             / 3600
         )
         st.error(f"🗑️ À descendre ! Signalé par **{demande['nom_demandeur']}**, "
@@ -317,7 +313,7 @@ def page_historique():
         st.markdown(
             f"✅ **{entree['personne']}** — {formater_ts(entree['ts'])}{mention}{saisie}"
         )
-        preuve = chemin_photo(entree["photo"])
+        preuve = bd.lire_photo(entree["photo"])
         if preuve:
             st.image(preuve, width=220)
 
@@ -444,6 +440,12 @@ def page_admin(moi):
         return
 
     st.subheader("🛠️ Administration")
+    libelles_mode = {
+        "turso-replique": "☁️ Turso — réplique locale (rapide)",
+        "turso-direct": "☁️ Turso — accès direct (réplique indisponible, un peu plus lent)",
+        "sqlite": "💾 Fichier SQLite local",
+    }
+    st.caption(f"Base de données : {libelles_mode.get(bd.MODE, bd.MODE)}")
 
     # ---- Vue d'ensemble ---------------------------------------------------
     stats = bd.stats_globales()
@@ -532,12 +534,14 @@ def page_admin(moi):
                     st.warning("🏖️ Absent·e — hors roulement.")
                     if st.button("Marquer de retour", key=f"back{coloc['id']}"):
                         bd.maj_coloc(coloc["id"], absent=0)
+                        bd.journaliser_action(moi["id"], "Retour de vacances", coloc["nom"])
                         st.rerun()
                 elif st.button("🏖️ Marquer absent·e (vacances)", key=f"away{coloc['id']}"):
                     if len(sched.colocs_disponibles()) <= 1:
                         st.error("Impossible : il ne resterait personne pour sortir les poubelles.")
                     else:
                         bd.maj_coloc(coloc["id"], absent=1)
+                        bd.journaliser_action(moi["id"], "Marqué absent", coloc["nom"])
                         if designe and designe["id"] == coloc["id"]:
                             bd.definir_tour(None)  # le roulement recalculera
                         st.rerun()
@@ -546,20 +550,25 @@ def page_admin(moi):
                 if coloc["id"] != moi["id"]:
                     if a1.button("Retirer de la coloc", key=f"del{coloc['id']}"):
                         bd.supprimer_coloc(coloc["id"])
+                        bd.journaliser_action(moi["id"], "Coloc retiré", coloc["nom"])
                         st.rerun()
                     libelle = "Retirer admin" if coloc["is_admin"] else "Passer admin"
                     if a2.button(libelle, key=f"adm{coloc['id']}"):
                         bd.maj_coloc(coloc["id"], is_admin=0 if coloc["is_admin"] else 1)
+                        bd.journaliser_action(moi["id"], "Droits admin " + ("retirés" if coloc["is_admin"] else "donnés"),
+                                              coloc["nom"])
                         st.rerun()
                 else:
                     a1.caption("C'est toi : tu ne peux ni te retirer ni te rétrograder.")
                 if appareils.get(coloc["id"]):
                     if st.button("Déconnecter tous ses appareils", key=f"out{coloc['id']}"):
                         bd.deconnecter_partout(coloc["id"])
+                        bd.journaliser_action(moi["id"], "Appareils déconnectés", coloc["nom"])
                         st.rerun()
             else:
                 if st.button("Réactiver", key=f"on{coloc['id']}"):
                     bd.maj_coloc(coloc["id"], actif=1)
+                    bd.journaliser_action(moi["id"], "Coloc réactivé", coloc["nom"])
                     st.rerun()
 
             # Pas d'email dans l'app : la réinitialisation passe par l'admin.
@@ -573,6 +582,7 @@ def page_admin(moi):
                             auth.valider_mot_de_passe(nouveau, nouveau)
                             bd.maj_coloc(coloc["id"], password_hash=auth.hacher(nouveau))
                             bd.deconnecter_partout(coloc["id"])
+                            bd.journaliser_action(moi["id"], "Mot de passe réinitialisé", coloc["nom"])
                             st.success(
                                 f"Mot de passe de {coloc['nom']} changé. "
                                 "Ses appareils ont été déconnectés."
@@ -585,6 +595,7 @@ def page_admin(moi):
         if st.form_submit_button("Ajouter"):
             try:
                 bd.creer_coloc(nom)
+                bd.journaliser_action(moi["id"], "Coloc ajouté", nom.strip())
                 st.rerun()
             except bd.ErreurBase as e:
                 st.error(str(e))
@@ -603,6 +614,7 @@ def page_admin(moi):
         else:
             index = {c["nom"]: c["id"] for c in actifs}
             bd.definir_ordre([index[n] for n in nouvel_ordre])
+            bd.journaliser_action(moi["id"], "Ordre modifié", " → ".join(nouvel_ordre))
             st.success("Ordre mis à jour.")
             st.rerun()
 
@@ -616,6 +628,7 @@ def page_admin(moi):
     )
     if st.button("Enregistrer le délai"):
         bd.set_reglage("delai_max_heures", delai)
+        bd.journaliser_action(moi["id"], "Délai modifié", f"{delai:g} h")
         st.success("Délai mis à jour.")
         st.rerun()
 
@@ -670,6 +683,7 @@ def page_admin(moi):
     if designe and g1.button(f"⏭️ Passer le tour de {designe['nom']}"):
         try:
             suivant = sched.passer_tour()
+            bd.journaliser_action(moi["id"], "Tour passé", f"{designe['nom']} → {suivant['nom']}")
             st.success(f"Tour passé à {suivant['nom']}.")
             st.rerun()
         except bd.ErreurBase as e:
@@ -695,6 +709,7 @@ def page_admin(moi):
                     cible = noms_ok[qui]
                     bd.ajouter_sortie(cible, None, bd.demande_ouverte(),
                                       enregistre_par=moi["id"])
+                    bd.journaliser_action(moi["id"], "Sortie saisie", qui)
                     suivant = sched.prochain_coloc()
                     notif.annoncer_validation(bd.get_coloc(cible), suivant)
                     st.success(
@@ -713,6 +728,7 @@ def page_admin(moi):
             choisi = st.selectbox("Personne", list(noms), key="forcer_tour")
             if st.button("Imposer"):
                 bd.definir_tour(noms[choisi])
+                bd.journaliser_action(moi["id"], "Tour imposé", choisi)
                 st.rerun()
             if bd.get_tour_force() and st.button("Revenir au roulement normal"):
                 bd.definir_tour(None)
@@ -738,9 +754,11 @@ def page_admin(moi):
                 if action.button("Annuler", key=f"annul{e['id']}"):
                     try:
                         photo = bd.annuler_sortie(e["id"])
-                        chemin = chemin_photo(photo)
-                        if chemin:
-                            os.remove(chemin)
+                        bd.supprimer_photo(photo)
+                        bd.journaliser_action(
+                            moi["id"], "Sortie annulée",
+                            f"{e['personne']} — {formater_ts(e['ts'])}",
+                        )
                         st.success(f"Sortie de {e['personne']} annulée.")
                         st.rerun()
                     except bd.ErreurBase as err:
@@ -758,6 +776,93 @@ def page_admin(moi):
     else:
         st.caption("Aucune sortie enregistrée.")
 
+    st.markdown("#### 📣 Annonce à la coloc")
+    with st.form("annonce"):
+        texte = st.text_area(
+            "Message WhatsApp envoyé à tous ceux qui ont activé leurs notifications",
+            max_chars=500,
+            placeholder="Ex. : Grand ménage samedi 10 h, tout le monde est attendu 🧹",
+        )
+        if st.form_submit_button("Envoyer à toute la coloc"):
+            if not texte.strip():
+                st.error("Le message est vide.")
+            else:
+                envoyes, ignores = notif.diffuser(f"📣 {moi['nom']} : {texte.strip()}")
+                bd.journaliser_action(
+                    moi["id"], "Annonce envoyée",
+                    f"{len(envoyes)} destinataire(s) — {texte.strip()[:80]}",
+                )
+                if envoyes:
+                    st.success("Envoyé à : " + ", ".join(envoyes))
+                if ignores:
+                    st.warning("Non joignables (WhatsApp non configuré) : " + ", ".join(ignores))
+
+    st.markdown("#### ⭐ Bonus / malus de points")
+    tous = bd.get_colocs()
+    if tous:
+        with st.form("points"):
+            noms_pts = {c["nom"]: c["id"] for c in tous}
+            qui_pts = st.selectbox("Colocataire", list(noms_pts))
+            delta = st.number_input(
+                "Points à ajouter (négatif pour retirer)",
+                min_value=-500, max_value=500, value=10, step=5,
+            )
+            motif = st.text_input("Motif (obligatoire, visible dans le journal)",
+                                  max_chars=120)
+            if st.form_submit_button("Appliquer"):
+                try:
+                    total = bd.ajuster_points(noms_pts[qui_pts], delta, motif, moi["id"])
+                    st.success(f"{qui_pts} : {int(delta):+d} pts → {total} pts.")
+                except bd.ErreurBase as e:
+                    st.error(str(e))
+
+    st.markdown("#### 🔑 Code d'invitation")
+    st.caption(
+        f"Code actuel : `{auth.code_invitation()}` — à donner aux nouveaux colocs. "
+        "Change-le si tu penses qu'il a circulé."
+    )
+    with st.form("code_invitation"):
+        nouveau_code = st.text_input("Nouveau code", max_chars=40)
+        if st.form_submit_button("Changer le code"):
+            nouveau_code = nouveau_code.strip()
+            if len(nouveau_code) < 6:
+                st.error("Le code doit faire au moins 6 caractères.")
+            else:
+                bd.set_reglage("code_invitation", nouveau_code)
+                bd.journaliser_action(moi["id"], "Code d'invitation changé")
+                st.success("Code mis à jour.")
+                st.rerun()
+
+    st.markdown("#### 🗂️ Journal des actions admin")
+    journal_admin = bd.get_audit(limite=50)
+    if journal_admin:
+        with st.expander(f"Voir les {len(journal_admin)} dernières actions"):
+            for a in journal_admin:
+                detail = f" — {a['detail']}" if a["detail"] else ""
+                st.caption(
+                    f"{formater_ts(a['ts'])} · **{a['nom_admin'] or '?'}** · "
+                    f"{a['action']}{html.escape(detail)}"
+                )
+    else:
+        st.caption("Aucune action enregistrée pour l'instant.")
+
+    st.markdown("#### 💾 Sauvegarde")
+    st.caption(
+        "Télécharge toute la base (comptes, historique, points, photos). "
+        "⚠️ Le fichier contient les mots de passe hachés et les clés WhatsApp : "
+        "garde-le pour toi."
+    )
+    if st.button("Préparer la sauvegarde"):
+        st.session_state["sauvegarde"] = bd.exporter()
+        bd.journaliser_action(moi["id"], "Sauvegarde téléchargée")
+    if st.session_state.get("sauvegarde"):
+        st.download_button(
+            "⬇️ Télécharger la sauvegarde (.json)",
+            st.session_state["sauvegarde"].encode("utf-8"),
+            file_name=f"sauvegarde-poubelles-{bd.aujourdhui().isoformat()}.json",
+            mime="application/json",
+        )
+
     st.markdown("#### Zone rouge")
     with st.expander("Vider l'historique / réinitialiser le planning"):
         st.caption(
@@ -771,6 +876,8 @@ def page_admin(moi):
                 st.error("Confirmation incorrecte.")
             else:
                 bd.reset_planning(effacer_historique=effacer)
+                bd.journaliser_action(moi["id"], "Planning réinitialisé",
+                                      "historique vidé" if effacer else "points remis à zéro")
                 st.success("Planning réinitialisé.")
                 st.rerun()
 
@@ -778,6 +885,35 @@ def page_admin(moi):
 # --------------------------------------------------------------------------
 # Routage
 # --------------------------------------------------------------------------
+
+    with st.expander("Restaurer une sauvegarde"):
+        st.caption(
+            "Remplace **toute** la base par le contenu du fichier. Tout le monde "
+            "sera déconnecté et devra se reconnecter avec les mots de passe "
+            "de la sauvegarde — toi compris."
+        )
+        fichier = st.file_uploader("Fichier de sauvegarde (.json)", type=["json"],
+                                   key="restauration")
+        confirmer = st.text_input("Tape RESTAURER pour confirmer", key="conf_restau")
+        if st.button("Restaurer", type="primary", key="go_restau"):
+            if fichier is None:
+                st.error("Choisis d'abord un fichier.")
+            elif confirmer != "RESTAURER":
+                st.error("Confirmation incorrecte.")
+            else:
+                try:
+                    bilan = bd.restaurer(fichier.getvalue().decode("utf-8"))
+                    # Après restauration, l'id de l'admin peut ne plus exister :
+                    # on journalise sans auteur plutôt que d'en attribuer un faux.
+                    bd.journaliser_action(
+                        None, "Base restaurée",
+                        ", ".join(f"{t} {n}" for t, n in bilan.items()),
+                    )
+                    st.success("Restauration terminée. Reconnecte-toi.")
+                    auth.deconnecter()
+                    st.rerun()
+                except (bd.ErreurBase, UnicodeDecodeError) as e:
+                    st.error(f"Restauration impossible : {e}")
 
 def application_connectee(moi):
     entete, bouton = st.columns([4, 1])
@@ -816,4 +952,10 @@ def main():
         application_connectee(moi)
 
 
-main()
+try:
+    _preparer_base()
+    main()
+except bd.ErreurBase as erreur:
+    # Coupure réseau vers la base, par exemple : un message plutôt qu'une trace.
+    st.error(f"😵 {erreur}")
+    st.caption("Si ça persiste, recharge la page dans une minute.")
