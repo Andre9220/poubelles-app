@@ -1,0 +1,38 @@
+services:
+
+  poubelles:
+
+    build: .
+
+    container_name: poubelles
+
+    restart: always
+
+    ports:
+      # Inchangé : Tailscale tourne en network_mode host et atteint ce port.
+      - "127.0.0.1:8501:8501"
+
+    volumes:
+      - ./data:/app/data
+
+    # Le noyau choisissait cette app comme victime quand la RAM manquait :
+    # elle est la plus légère de la machine. On la déclasse comme cible.
+    oom_score_adj: -500
+
+    # Évite qu'un plantage en boucle sature les logs et le CPU.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    environment:
+      POUBELLES_DB: /app/data/poubelles.db
+      POUBELLES_UPLOADS: /app/data/uploads
+      # Code demandé pour créer un compte. À changer.
+      POUBELLES_CODE_INVITATION: "${POUBELLES_CODE_INVITATION:-coloc2026}"
+      # Pseudo qui obtient les droits admin à l'inscription.
+      POUBELLES_ADMIN: "${POUBELLES_ADMIN:-andre}"
+      TZ: "${TZ:-America/Toronto}"
+      # Coupe-circuit WhatsApp : mettre à 0 pour tout tester sans rien envoyer.
+      POUBELLES_WHATSAPP: "${POUBELLES_WHATSAPP:-1}"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Vérification périodique de Mission Poubelles
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

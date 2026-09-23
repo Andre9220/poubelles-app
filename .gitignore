@@ -1,0 +1,14 @@
+# Données : jamais dans le dépôt (comptes, mots de passe hachés, clés WhatsApp)
+data/
+*.db
+*.db-*
+*.bak*
+sauvegarde*.json
+
+# Secrets Streamlit
+.streamlit/secrets.toml
+
+__pycache__/
+*.pyc
+.venv/
+venv/

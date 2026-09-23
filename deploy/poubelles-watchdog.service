@@ -1,0 +1,10 @@
+[Unit]
+Description=Vérifie que Mission Poubelles tourne, la relance sinon
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/umbrel/poubelles-app
+# `up -d` est idempotent : ne fait rien si le conteneur tourne déjà.
+ExecStart=/usr/bin/docker compose up -d --remove-orphans

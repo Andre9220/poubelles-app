@@ -1,0 +1,21 @@
+[Unit]
+Description=Mission Poubelles (Streamlit)
+Documentation=https://umbrel.tail2fcf06.ts.net:8443
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+# Tourne en root : immunisé aux réinitialisations du groupe docker.
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/umbrel/poubelles-app
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=0
+# Si docker n'est pas encore prêt au démarrage, on réessaie.
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
