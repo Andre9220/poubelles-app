@@ -1,6 +1,6 @@
 streamlit==1.45.1
 bcrypt==4.2.1
-Pillow==11.1.0
+Pillow==11.3.0
 # Client Turso (SQLite hébergé), utilisé seulement si TURSO_DATABASE_URL est défini.
 libsql==0.1.11
 # Base des fuseaux horaires, pour l'heure de Montréal quel que soit le serveur.
